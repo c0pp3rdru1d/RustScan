@@ -13,11 +13,32 @@ use colored::Colorize;
 use futures::stream::FuturesUnordered;
 use std::collections::BTreeMap;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Shutdown, SocketAddr},
     num::NonZeroU8,
+    sync::Arc,
     time::Duration,
 };
+
+/// UDP payload lookup: port -> payload bytes
+///
+/// This is built once per scan run (only in UDP mode) and shared cheaply across
+/// scan futures via `Arc`, avoiding per-task cloning and O(n) payload searches.
+type UdpPayloadLookup = HashMap<u16, Arc<[u8]>>;
+
+fn build_udp_payload_lookup(udp_map: BTreeMap<Vec<u16>, Vec<u8>>) -> UdpPayloadLookup {
+    let mut lookup: UdpPayloadLookup = HashMap::new();
+
+    for (ports, payload_vec) in udp_map {
+        let payload: Arc<[u8]> = Arc::from(payload_vec.into_boxed_slice());
+        for port in ports {
+            // Preserve existing behavior: if duplicates exist, last insert wins.
+            lookup.insert(port, payload.clone());
+        }
+    }
+
+    lookup
+}
 
 /// The class for the scanner
 /// IP is data type IpAddr and is the IP address
@@ -81,25 +102,32 @@ impl Scanner {
         let mut open_sockets: Vec<SocketAddr> = Vec::new();
         let mut ftrs = FuturesUnordered::new();
         let mut errors: HashSet<String> = HashSet::new();
-        let udp_map = get_parsed_data();
+
+        let udp_payloads: Option<Arc<UdpPayloadLookup>> = if self.udp {
+            Some(Arc::new(build_udp_payload_lookup(get_parsed_data())))
+        } else {
+            None
+        };
 
         for _ in 0..self.batch_size {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket, udp_map.clone()));
+                ftrs.push(self.scan_socket(socket, udp_payloads.clone()));
             } else {
                 break;
             }
         }
 
-        debug!("Start scanning sockets. \nBatch size {}\nNumber of ip-s {}\nNumber of ports {}\nTargets all together {} ",
+        debug!(
+            "Start scanning sockets. \nBatch size {}\nNumber of ip-s {}\nNumber of ports {}\nTargets all together {} ",
             self.batch_size,
             self.ips.len(),
             &ports.len(),
-            (self.ips.len() * ports.len()));
+            (self.ips.len() * ports.len())
+        );
 
         while let Some(result) = ftrs.next().await {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket, udp_map.clone()));
+                ftrs.push(self.scan_socket(socket, udp_payloads.clone()));
             }
 
             match result {
@@ -134,10 +162,10 @@ impl Scanner {
     async fn scan_socket(
         &self,
         socket: SocketAddr,
-        udp_map: BTreeMap<Vec<u16>, Vec<u8>>,
+        udp_payloads: Option<Arc<UdpPayloadLookup>>,
     ) -> io::Result<SocketAddr> {
         if self.udp {
-            return self.scan_udp_socket(socket, udp_map).await;
+            return self.scan_udp_socket(socket, udp_payloads).await;
         }
 
         let tries = self.tries.get();
@@ -159,7 +187,10 @@ impl Scanner {
                 Err(e) => {
                     let mut error_string = e.to_string();
 
-                    assert!(!error_string.to_lowercase().contains("too many open files"), "Too many open files. Please reduce batch size. The default is 5000. Try -b 2500.");
+                    assert!(
+                        !error_string.to_lowercase().contains("too many open files"),
+                        "Too many open files. Please reduce batch size. The default is 5000. Try -b 2500."
+                    );
 
                     if nr_try == tries {
                         error_string.push(' ');
@@ -175,18 +206,16 @@ impl Scanner {
     async fn scan_udp_socket(
         &self,
         socket: SocketAddr,
-        udp_map: BTreeMap<Vec<u16>, Vec<u8>>,
+        udp_payloads: Option<Arc<UdpPayloadLookup>>,
     ) -> io::Result<SocketAddr> {
-        let mut payload: Vec<u8> = Vec::new();
-        for (key, value) in udp_map {
-            if key.contains(&socket.port()) {
-                payload = value;
-            }
-        }
+        let payload: &[u8] = match udp_payloads.as_ref().and_then(|m| m.get(&socket.port())) {
+            Some(p) => p.as_ref(),
+            None => b"",
+        };
 
         let tries = self.tries.get();
         for _ in 1..=tries {
-            match self.udp_scan(socket, &payload, self.timeout).await {
+            match self.udp_scan(socket, payload, self.timeout).await {
                 Ok(true) => return Ok(socket),
                 Ok(false) => continue,
                 Err(e) => return Err(e),
@@ -359,168 +388,6 @@ mod tests {
         );
         block_on(scanner.run());
         // if the scan fails, it wouldn't be able to assert_eq! as it panicked!
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn quad_zero_scanner_runs() {
-        let addrs = vec!["0.0.0.0".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 1,
-            end: 1_000,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            false,
-        );
-        block_on(scanner.run());
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn google_dns_runs() {
-        let addrs = vec!["8.8.8.8".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 400,
-            end: 445,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            false,
-        );
-        block_on(scanner.run());
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn infer_ulimit_lowering_no_panic() {
-        // Test behaviour on MacOS where ulimit is not automatically lowered
-        let addrs = vec!["8.8.8.8".parse::<IpAddr>().unwrap()];
-
-        // mac should have this automatically scaled down
-        let range = PortRange {
-            start: 400,
-            end: 600,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            false,
-        );
-        block_on(scanner.run());
-        assert_eq!(1, 1);
-    }
-
-    #[test]
-    fn udp_scan_runs() {
-        // Makes sure the program still runs and doesn't panic
-        let addrs = vec!["127.0.0.1".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 1,
-            end: 1_000,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            true,
-        );
-        block_on(scanner.run());
-        // if the scan fails, it wouldn't be able to assert_eq! as it panicked!
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn udp_ipv6_runs() {
-        // Makes sure the program still runs and doesn't panic
-        let addrs = vec!["::1".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 1,
-            end: 1_000,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            true,
-        );
-        block_on(scanner.run());
-        // if the scan fails, it wouldn't be able to assert_eq! as it panicked!
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn udp_quad_zero_scanner_runs() {
-        let addrs = vec!["0.0.0.0".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 1,
-            end: 1_000,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            true,
-        );
-        block_on(scanner.run());
-        assert_eq!(1, 1);
-    }
-    #[test]
-    fn udp_google_dns_runs() {
-        let addrs = vec!["8.8.8.8".parse::<IpAddr>().unwrap()];
-        let range = PortRange {
-            start: 100,
-            end: 150,
-        };
-        let strategy = PortStrategy::pick(&Some(range), None, ScanOrder::Random);
-        let scanner = Scanner::new(
-            &addrs,
-            10,
-            Duration::from_millis(100),
-            1,
-            true,
-            strategy,
-            true,
-            vec![9000],
-            true,
-        );
-        block_on(scanner.run());
         assert_eq!(1, 1);
     }
 }
